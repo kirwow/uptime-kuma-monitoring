@@ -1,130 +1,120 @@
-# Локальный отказоустойчивый контур мониторинга для Uptime Kuma
+# MonitorKuma — Отказоустойчивый стенд мониторинга в Docker Compose и Kubernetes
 
-Проект разворачивает продакшн-сервис **Uptime Kuma** на базе внешней БД **MariaDB** и независимый стек наблюдаемости (**Prometheus**, **Grafana** и набор экспортёров), управляемый декларативным **Dagger-модулем** на Python.
+Инфраструктурный проект, реализующий архитектуру **«мониторинга за мониторингом»** (Observability over Monitoring). Проект разворачивает систему проверки доступности сервисов **Uptime Kuma** с внешней реляционной БД **MariaDB** и независимый стек наблюдаемости на базе **Prometheus**, **Grafana** и специализированных экспортеров.
 
----
-
-## 1. Архитектура решения
-
-Инфраструктура разделена на два независимых слоя Docker Compose, объединённых общей внешней сетью `kuma-net`:
-
-1. **Слой 1 — Приложение и БД (`compose.app.yaml`):**
-   * **`mariadb` (`mariadb:10.11`)** — реляционная БД для хранения данных Uptime Kuma. Использует именованный том `mariadb_data` для персистентности данных, `healthcheck` и политику `restart: unless-stopped`.
-   * **`uptime-kuma` (`louislam/uptime-kuma:2`)** — веб-сервис мониторинга, подключённый к MariaDB по внутренней сети. Запускается строго после прохождения healthcheck базы данных.
-
-2. **Слой 2 — Наблюдаемость (`compose.monitoring.yaml`):**
-   * **`prometheus` (`prom/prometheus:v2.54.1`)** — сбор и хранение метрик (интервал скрапинга `10s`).
-   * **`grafana` (`grafana/grafana:11.2.2`)** — визуализация метрик. Data Source и дашборды накатываются программно через Grafana HTTP API.
-   * **Экспортёры метрик:**
-     * `cadvisor` (`gcr.io/cadvisor/cadvisor:v0.49.1`) — потребление CPU, RAM и сетевых ресурсов Docker-контейнеров.
-     * `node-exporter` (`prom/node-exporter:v1.8.2`) — системные метрики хоста (Load Average, память, диски).
-     * `mysqld-exporter` (`prom/mysqld-exporter:v0.15.1`) — состояние базы данных MariaDB (`mysql_up`, активные соединения).
-     * `blackbox-exporter` (`prom/blackbox-exporter:v0.25.0`) — синтетические HTTP-пробы доступности и latency веб-интерфейса Uptime Kuma (`probe_success`, `probe_duration_seconds`).
-
-3. **Автоматизация (Dagger.io):**
-   * В корне репозитория расположен Dagger-модуль `monitor-kuma` (`dagger.json` + `.dagger/src/monitor_kuma/main.py`).
-   * Управление хостовым Docker-демоном осуществляется через проброс Unix-сокета `/var/run/docker.sock`.
+Инфраструктура описана декларативно в двух вариантах:
+* **Docker Compose + Dagger** — модульное локальное развёртывание и программируемые CI/CD-пайплайны с автоматической настройкой дашбордов и Chaos-тестированием.
+* **Kubernetes** — продакшн-ориентированная конфигурация с изоляцией слоёв по неймспейсам, персистентным хранением данных и самовосстановлением (Self-Healing).
 
 ---
 
-## 2. Системные требования и подготовка окружения
+## Архитектура проекта
 
-Для локального запуска потребуются:
-* **ОС:** Linux, macOS или Windows 10/11 (WSL2)
-* **Docker Engine / Docker Desktop** с запущенным демоном и доступным сокетом `/var/run/docker.sock`
-* **Dagger CLI** (`v0.15+` / `v0.21+`)
+Стенд разделён на два логически изолированных слоя (в Kubernetes им соответствуют отдельные `Namespace`):
 
-### Установка Dagger CLI (если не установлен)
-* **macOS (Homebrew):**
-  ```bash
-  brew install dagger/tap/dagger
-  ```
-* **Linux / WSL:**
-  ```bash
-  curl -fsSL https://dl.dagger.io/dagger/install.sh | BIN_DIR=/usr/local/bin sh
-  ```
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                    Kubernetes Cluster                       │
+│                                                             │
+│  ┌───────────────────────────┐   ┌───────────────────────┐  │
+│  │  Namespace: uptime-kuma   │   │ Namespace: monitoring │  │
+│  │                           │   │                       │  │
+│  │  ┌─────────────────────┐  │   │  ┌─────────────────┐  │  │
+│  │  │  Uptime Kuma (Pod)  │◄─┼───┼──┤Blackbox Exporter│  │  │
+│  │  │  (Deployment + PVC) │  │   │  └────────▲────────┘  │  │
+│  │  └──────────┬──────────┘  │   │           │           │  │
+│  │             │ TCP:3306    │   │  ┌────────┴────────┐  │  │
+│  │  ┌──────────▼──────────┐  │   │  │   Prometheus    │  │  │
+│  │  │    MariaDB (Pod)    │◄─┼───┼──┤ MySQLd Exporter │  │  │
+│  │  │ (StatefulSet + PVC) │  │   │  └────────┬────────┘  │  │
+│  │  └─────────────────────┘  │   │           │           │  │
+│  └───────────────────────────┘   │  ┌────────▼────────┐  │  │
+│                                  │  │     Grafana     │  │  │
+│                                  │  └─────────────────┘  │  │
+│                                  └───────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
 
-### Подготовка переменных окружения
-Перед запуском вы можете скопировать шаблон переменных окружения (при запуске через Dagger файл `.env` создаётся автоматически из `.env.example`, если отсутствует):
-```bash
-cp .env.example .env
+### Слой 1: Продуктовое приложение (`uptime-kuma`)
+* **Uptime Kuma (`Deployment`)** — движок проверок доступности сайтов и API. Настроены `readinessProbe` и `livenessProbe`, данные сохраняются на `PersistentVolumeClaim`.
+* **MariaDB (`StatefulSet`)** — внешняя СУБД для хранения истории проверок, конфигураций мониторов и учётных записей. Использует отдельный `PVC` и `Secret` для реквизитов доступа.
+
+### Слой 2: Стек наблюдаемости (`monitoring`)
+* **Blackbox Exporter (`Deployment`)** — проверяет HTTP-доступность интерфейса Uptime Kuma снаружи по внутренней DNS-сети кластера (`http://uptime-kuma.uptime-kuma.svc.cluster.local:3001`).
+* **MySQLd Exporter (`Deployment`)** — собирает внутренние метрики производительности и соединений MariaDB.
+* **Prometheus (`Deployment` + `ConfigMap` + `PVC`)** — опрашивает экспортеры каждые 10 секунд и хранит временные ряды метрик.
+* **Grafana (`Deployment` + `ConfigMap` + `PVC`)** — визуализирует состояние приложения, БД и HTTP-проб на дашбордах.
+
+---
+
+## Структура репозитория
+
+```text
+.
+├── k8s/
+│   ├── app/
+│   │   └── manifest.yaml          # Namespace uptime-kuma, Secret, PVC, StatefulSet (MariaDB), Deployment (Kuma), Services
+│   └── monitoring/
+│       └── manifest.yaml          # Namespace monitoring, ConfigMaps, Secret, PVC, Prometheus, Grafana, Exporters
+├── compose/                       # Модульные файлы Docker Compose (app, monitoring, network)
+├── dagger/                        # Программируемый пайплайн на Dagger (деплой, API-настройка Grafana, Chaos Test)
+└── README.md
 ```
 
 ---
 
-## 3. Запуск и управление через Dagger
+## Быстрый старт в Kubernetes
 
-Все команды выполняются из корневой директории проекта.
+### Предварительные требования
+* Локальный или облачный Kubernetes-кластер (`Docker Desktop`, `Colima`, `Minikube`, `kind` или `k3d`)
+* Установленный `kubectl`
 
-### Просмотр доступных функций модуля
+### 1. Развёртывание стенда
+Примените манифесты продуктового слоя и стека мониторинга:
+
 ```bash
-dagger functions
+kubectl apply -f k8s/app/manifest.yaml
+kubectl apply -f k8s/monitoring/manifest.yaml
 ```
 
-### Пошаговое развёртывание (основные команды)
+### 2. Проверка статуса подов и томов
+Дождитесь перехода всех подов в статус `Running` (`1/1 Ready`):
 
-1. **Запуск Слоя 1 (MariaDB и Uptime Kuma):**
-   ```bash
-   dagger call deploy-app --docker-socket=/var/run/docker.sock
-   ```
-
-2. **Запуск Слоя 2 (Prometheus, Grafana и экспортеры):**
-   ```bash
-   dagger call deploy-monitoring --docker-socket=/var/run/docker.sock
-   ```
-
-3. **Настройка Grafana через HTTP API (создание Data Source и импорт дашборда):**
-   ```bash
-   dagger call configure-grafana --docker-socket=/var/run/docker.sock
-   ```
-
-### Бонусные сценарии
-
-* **End-to-End Orchestration (развёртывание всей платформы одной командой и проверка здоровья всех систем):**
-  ```bash
-  dagger call deploy-all --docker-socket=/var/run/docker.sock
-  ```
-
-* **Chaos Testing (имитация отказа сервиса, проверка перехода дашборда в статус `DOWN (ВСЁ ПЛОХО)` и последующего восстановления в `UP`):**
-  ```bash
-  # Тест отказа веб-приложения Uptime Kuma (по умолчанию)
-  dagger call chaos-test --docker-socket=/var/run/docker.sock
-
-  # Тест отказа базы данных MariaDB
-  dagger call chaos-test --docker-socket=/var/run/docker.sock --target=kuma-mariadb
-  ```
-
----
-
-## 4. Доступ к сервисам и проверка работоспособности
-
-После успешного выполнения команд сервисы доступны локально по следующим адресам:
-
-| Сервис | URL | Учётные данные по умолчанию |
-| :--- | :--- | :--- |
-| **Uptime Kuma** | http://localhost:3001 | Создание администратора при первом входе |
-| **Grafana** | http://localhost:3000 | `admin` / `admin` (из `.env`) |
-| **Prometheus** | http://localhost:9090 | Без авторизации |
-| **cAdvisor** | http://localhost:8080 | Без авторизации |
-
-### Чек-лист проверки компонентов
-
-1. **Проверка контейнеров:**
-   Выполните `docker ps` — все 8 контейнеров (`kuma-mariadb`, `uptime-kuma`, `kuma-prometheus`, `kuma-grafana`, `kuma-node-exporter`, `kuma-cadvisor`, `kuma-mysqld-exporter`, `kuma-blackbox-exporter`) должны находиться в статусе `Up` (а `kuma-mariadb` — в статусе `healthy`).
-2. **Проверка сбора метрик в Prometheus:**
-   Откройте http://localhost:9090/targets — все 5 target-групп (`prometheus`, `node-exporter`, `cadvisor`, `mariadb`, `blackbox-uptime-kuma`) должны иметь статус **`UP`**.
-3. **Проверка дашборда в Grafana:**
-   * Авторизуйтесь в http://localhost:3000 (`admin` / `admin`).
-   * Перейдите в раздел **Dashboards** и откройте **Uptime Kuma & Infrastructure Health**.
-   * Убедитесь, что виджеты **Uptime Kuma Status** и **MariaDB Database Status** отображают зелёный статус **`UP (OK)`**, а графики **HTTP Latency**, **Containers CPU Usage**, **Containers RAM Usage** и **MariaDB Connections & Host Load** строятся в реальном времени.
-
----
-
-## 5. Остановка и очистка стенда
-
-Для остановки контейнеров и удаления созданных ресурсов выполните:
 ```bash
-docker compose -p monitor-kuma-mon -f compose.monitoring.yaml down -v
-docker compose -p monitor-kuma-app -f compose.app.yaml down -v
-docker network rm kuma-net
+kubectl get pods -n uptime-kuma
+kubectl get pods -n monitoring
+kubectl get pvc -A
 ```
+
+### 3. Доступ к веб-интерфейсам (`port-forward`)
+Пробросьте порты сервисов на локальную машину:
+
+```bash
+# Uptime Kuma -> http://localhost:3001
+kubectl port-forward svc/uptime-kuma -n uptime-kuma 3001:3001 &
+
+# Grafana -> http://localhost:3000
+kubectl port-forward svc/grafana -n monitoring 3000:3000 &
+
+# Prometheus -> http://localhost:9090
+kubectl port-forward svc/prometheus -n monitoring 9090:9090 &
+```
+
+### 4. Проверка Self-Healing и сохранности данных
+Вы можете принудительно удалить под приложения или базы данных — контроллеры `Deployment` / `StatefulSet` автоматически пересоздадут их, а данные останутся на `PVC`:
+
+```bash
+kubectl delete pod -l app=uptime-kuma -n uptime-kuma
+kubectl get pods -n uptime-kuma -w
+```
+
+### 5. Остановка и очистка ресурсов
+
+```bash
+pkill -f "kubectl port-forward"
+kubectl delete -f k8s/monitoring/manifest.yaml
+kubectl delete -f k8s/app/manifest.yaml
+```
+*(Для полного удаления персистентных томов данных: `kubectl delete pvc --all -n uptime-kuma`).*
+
+---
