@@ -1,0 +1,163 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: uptime-kuma
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mariadb-secret
+  namespace: uptime-kuma
+type: Opaque
+stringData:
+  MYSQL_ROOT_PASSWORD: "supersecretroot"
+  MYSQL_DATABASE: "uptimekuma"
+  MYSQL_USER: "kuma"
+  MYSQL_PASSWORD: "kumapassword"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mariadb
+  namespace: uptime-kuma
+spec:
+  ports:
+    - port: 3306
+      name: mysql
+  clusterIP: None
+  selector:
+    app: mariadb
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mariadb
+  namespace: uptime-kuma
+spec:
+  serviceName: "mariadb"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mariadb
+  template:
+    metadata:
+      labels:
+        app: mariadb
+    spec:
+      containers:
+        - name: mariadb
+          image: mariadb:10.11
+          ports:
+            - containerPort: 3306
+              name: mysql
+          envFrom:
+            - secretRef:
+                name: mariadb-secret
+          readinessProbe:
+            exec:
+              command: ["healthcheck.sh", "--connect", "--innodb_initialized"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["healthcheck.sh", "--connect"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          volumeMounts:
+            - name: mariadb-data
+              mountPath: /var/lib/mysql
+  volumeClaimTemplates:
+    - metadata:
+        name: mariadb-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kuma-data-pvc
+  namespace: uptime-kuma
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: uptime-kuma
+  namespace: uptime-kuma
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: uptime-kuma
+  template:
+    metadata:
+      labels:
+        app: uptime-kuma
+    spec:
+      containers:
+        - name: uptime-kuma
+          image: louislam/uptime-kuma:2
+          ports:
+            - containerPort: 3001
+          env:
+            - name: UPTIME_KUMA_DB_TYPE
+              value: "mariadb"
+            - name: UPTIME_KUMA_DB_HOSTNAME
+              value: "mariadb.uptime-kuma.svc.cluster.local"
+            - name: UPTIME_KUMA_DB_PORT
+              value: "3306"
+            - name: UPTIME_KUMA_DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: mariadb-secret
+                  key: MYSQL_DATABASE
+            - name: UPTIME_KUMA_DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: mariadb-secret
+                  key: MYSQL_USER
+            - name: UPTIME_KUMA_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mariadb-secret
+                  key: MYSQL_PASSWORD
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3001
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 3001
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          volumeMounts:
+            - name: kuma-data
+              mountPath: /app/data
+      volumes:
+        - name: kuma-data
+          persistentVolumeClaim:
+            claimName: kuma-data-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: uptime-kuma
+  namespace: uptime-kuma
+spec:
+  type: NodePort
+  ports:
+    - port: 3001
+      targetPort: 3001
+      nodePort: 30081
+  selector:
+    app: uptime-kuma
